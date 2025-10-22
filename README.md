@@ -8,6 +8,7 @@ Proyecto de referencia que combina ETL de criptoactivos y un pipeline de churn c
 - **MLflow 2.10**: tracking server + model registry con artefactos en MinIO.
 - **MinIO**: backend S3 compatible (`s3://mlflow-artifacts/`).
 - **JupyterLab**: entorno de exploración y notebooks.
+- **Streamlit**: UI para explorar el modelo de churn registrado en MLflow.
 
 ## Estructura relevante
 ```
@@ -95,6 +96,26 @@ airflow dags test churn_batch_score_w 2019-05-26
 ```
 
 La iteración diaria de cripto (`etl_crypto_events_d`) también se alinea con estas fechas sin necesitar parámetros adicionales.
+
+### UI de Streamlit (modelo de churn)
+La app de Streamlit (http://localhost:8501) consume el modelo `churn-logreg` registrado por el
+pipeline mensual (`ml/train.py`). Para asegurarte de que exista una versión en `Production`
+podés ejecutar:
+
+```bash
+docker compose --env-file .env -f docker/docker-compose.yml exec airflow-webserver \
+  airflow dags test churn_train_register_m 2019-05-31
+```
+
+Luego reiniciá el servicio de Streamlit si fuese necesario:
+
+```bash
+docker compose --env-file .env -f docker/docker-compose.yml up -d streamlit
+```
+
+La interfaz permite cargar manualmente los features semanales definidos en `ml/model_config.py`
+y obtiene la probabilidad estimada de churn directamente desde MLflow, sin utilizar
+`MLFlowDeploymentService`.
 
 ## Notebooks y análisis
 El contenedor de Jupyter monta el repo completo en `/home/jovyan/work`. Los notebooks disponen de las mismas variables de conexión que Airflow (`POSTGRES_*`, `MLFLOW_*`).
