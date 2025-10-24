@@ -2,9 +2,11 @@ FROM apache/airflow:2.8.1-python3.10
 
 USER root
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends build-essential libpq-dev git && \
+    apt-get install -y --no-install-recommends build-essential libpq-dev git openjdk-17-jre-headless procps && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 USER airflow
 COPY requirements.txt /requirements.txt
 RUN pip install --no-cache-dir -r /requirements.txt
+
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64

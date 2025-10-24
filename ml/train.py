@@ -4,19 +4,16 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import List, Tuple
+from typing import List
 
-import numpy as np
 import pandas as pd
-from mlflow.models.signature import infer_signature
-from sklearn.compose import ColumnTransformer
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, roc_auc_score
-from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 import mlflow
+from pyspark.ml import Pipeline
+from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from pyspark.ml.feature import OneHotEncoder, StringIndexer, VectorAssembler
+from pyspark.sql import DataFrame, SparkSession, functions as F
 
 
 logger = logging.getLogger(__name__)
@@ -66,128 +63,145 @@ def _load_training_data(config: TrainingConfig) -> pd.DataFrame:
         config.snapshot_dt.date(),
         len(df),
     )
-    numeric_like = [col for col in NUMERIC_FEATURES if col in df.columns]
-    for col in numeric_like:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    if df.empty:
-        raise ValueError("No training data available for the requested window")
     return df
 
 
-def _split_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, List[str], List[str]]:
-    available_numeric = [col for col in NUMERIC_FEATURES if col in df.columns]
-    available_binary = [col for col in BINARY_FEATURES if col in df.columns]
-    available_categoricals = [col for col in CATEGORICAL_FEATURES if col in df.columns]
-
-    X = df[available_numeric + available_binary + available_categoricals].copy()
-    y = df["labeled_churn"].astype(int)
-
-    for binary_col in available_binary:
-        X[binary_col] = X[binary_col].astype(int)
-
-    numeric_cols = available_numeric + available_binary
-    return X, y, numeric_cols, available_categoricals
-
-
-def _build_pipeline(numeric_cols: List[str], categorical_cols: List[str]) -> Pipeline:
-    transformers = []
-    if numeric_cols:
-        transformers.append(("num", StandardScaler(), numeric_cols))
-    if categorical_cols:
-        transformers.append((
-            "cat",
-            OneHotEncoder(handle_unknown="ignore"),
-            categorical_cols,
-        ))
-
-    preprocessor = ColumnTransformer(transformers, remainder="drop")
-    model = LogisticRegression(max_iter=1000, class_weight="balanced")
-    return Pipeline(
-        steps=[
-            ("preprocessor", preprocessor),
-            ("model", model),
-        ]
+def _create_spark_session() -> SparkSession:
+    master = os.getenv("SPARK_MASTER_URL", "local[*]")
+    app_name = os.getenv("SPARK_APP_NAME", "churn-train")
+    spark = (
+        SparkSession.builder.appName(app_name)
+        .master(master)
+        .config("spark.sql.shuffle.partitions", os.getenv("SPARK_SQL_SHUFFLE_PARTITIONS", "32"))
+        .getOrCreate()
     )
+    return spark
+
+
+def _prepare_spark_dataframe(spark: SparkSession, df: pd.DataFrame) -> DataFrame:
+    spark_df = spark.createDataFrame(df)
+
+    # Cast numeric / binary features and label to double
+    for col in NUMERIC_FEATURES + BINARY_FEATURES + ["labeled_churn"]:
+        if col in spark_df.columns:
+            spark_df = spark_df.withColumn(col, F.col(col).cast("double"))
+
+    # Fill missing categorical values
+    fill_values = {col: "unknown" for col in CATEGORICAL_FEATURES if col in spark_df.columns}
+    if fill_values:
+        spark_df = spark_df.fillna(fill_values)
+
+    return spark_df
 
 
 def train_and_register(snapshot_date: str, lookback_weeks: int = 8) -> str:
     config = TrainingConfig(snapshot_date=snapshot_date, lookback_weeks=lookback_weeks)
     df = _load_training_data(config)
-    X, y, numeric_cols, categorical_cols = _split_features(df)
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
-    logger.info(
-        "Prepared dataset: train=%d rows, test=%d rows, features_num=%d, features_cat=%d",
-        len(X_train),
-        len(X_test),
-        len(numeric_cols),
-        len(categorical_cols),
-    )
+    spark = _create_spark_session()
+    try:
+        spark_df = _prepare_spark_dataframe(spark, df)
+        available_categoricals = [col for col in CATEGORICAL_FEATURES if col in spark_df.columns]
 
-    pipeline = _build_pipeline(numeric_cols, categorical_cols)
+        indexers = [
+            StringIndexer(inputCol=feature, outputCol=f"{feature}_idx", handleInvalid="keep")
+            for feature in available_categoricals
+        ]
+        encoders = [
+            OneHotEncoder(inputCol=f"{feature}_idx", outputCol=f"{feature}_oh", handleInvalid="keep")
+            for feature in available_categoricals
+        ]
 
-    mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000"))
-    mlflow.set_experiment("churn-logreg-experiment")
+        assembler_inputs: List[str] = []
+        assembler_inputs.extend([col for col in NUMERIC_FEATURES if col in spark_df.columns])
+        assembler_inputs.extend([col for col in BINARY_FEATURES if col in spark_df.columns])
+        assembler_inputs.extend([f"{feature}_oh" for feature in available_categoricals])
+        assembler = VectorAssembler(inputCols=assembler_inputs, outputCol="features")
 
-    with mlflow.start_run(run_name=f"train_{snapshot_date}") as run:
-        pipeline.fit(X_train, y_train)
-        y_pred_proba = pipeline.predict_proba(X_test)[:, 1]
-        y_pred = (y_pred_proba >= 0.5).astype(int)
-
-        metrics = {
-            "accuracy": float(accuracy_score(y_test, y_pred)),
-            "roc_auc": float(roc_auc_score(y_test, y_pred_proba)),
-            "positive_rate_train": float(np.mean(y_train)),
-            "positive_rate_test": float(np.mean(y_test)),
-        }
-        mlflow.log_metrics(metrics)
-        mlflow.log_params(
-            {
-                "snapshot_date": snapshot_date,
-                "lookback_weeks": lookback_weeks,
-                "numeric_features": ",".join(numeric_cols),
-                "categorical_features": ",".join(categorical_cols),
-            }
+        lr = LogisticRegression(
+            featuresCol="features",
+            labelCol="labeled_churn",
+            maxIter=50,
+            elasticNetParam=0.0,
         )
+
+        pipeline = Pipeline(stages=indexers + encoders + [assembler, lr])
+        train_df, test_df = spark_df.randomSplit([0.8, 0.2], seed=42)
         logger.info(
-            "Evaluation metrics | accuracy=%.4f roc_auc=%.4f pos_rate_train=%.4f pos_rate_test=%.4f",
-            metrics["accuracy"],
-            metrics["roc_auc"],
-            metrics["positive_rate_train"],
-            metrics["positive_rate_test"],
+            "Prepared dataset: train=%d rows, test=%d rows",
+            train_df.count(),
+            test_df.count(),
         )
 
-        signature = infer_signature(X_train, pipeline.predict_proba(X_train)[:, 1])
-        model_name = get_model_name()
-        model_info = mlflow.sklearn.log_model(
-            pipeline,
-            artifact_path="model",
-            registered_model_name=model_name,
-            signature=signature,
-            input_example=X_train.head(1),
-        )
+        mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000"))
+        mlflow.set_experiment("churn-logreg-experiment")
 
-        client = get_mlflow_client()
-        registered_versions = client.search_model_versions(
-            filter_string=f"run_id='{run.info.run_id}'"
-        )
-        if not registered_versions:
-            raise RuntimeError("Model registration failed")
+        with mlflow.start_run(run_name=f"train_{snapshot_date}") as run:
+            model = pipeline.fit(train_df)
+            predictions = model.transform(test_df)
 
-        version = registered_versions[0].version
-        logger.info("Registered model %s version %s", model_name, version)
-        client.transition_model_version_stage(
-            name=model_name,
-            version=version,
-            stage="Production",
-            archive_existing_versions=True,
-        )
-        logger.info("Promoted model %s version %s to Production", model_name, version)
+            evaluator = BinaryClassificationEvaluator(
+                labelCol="labeled_churn", rawPredictionCol="rawPrediction", metricName="areaUnderROC"
+            )
+            roc_auc = evaluator.evaluate(predictions)
+            accuracy = predictions.select(
+                F.mean((F.col("prediction") == F.col("labeled_churn")).cast("double")).alias("acc")
+            ).collect()[0]["acc"]
 
-        mlflow.set_tag("model_version", version)
-        mlflow.set_tag("production_ready", True)
+            positive_rate_train = train_df.agg(F.mean("labeled_churn").alias("rate")).collect()[0]["rate"]
+            positive_rate_test = test_df.agg(F.mean("labeled_churn").alias("rate")).collect()[0]["rate"]
+
+            metrics = {
+                "roc_auc": float(roc_auc),
+                "accuracy": float(accuracy),
+                "positive_rate_train": float(positive_rate_train),
+                "positive_rate_test": float(positive_rate_test),
+            }
+            mlflow.log_metrics(metrics)
+            mlflow.log_params(
+                {
+                    "snapshot_date": snapshot_date,
+                    "lookback_weeks": lookback_weeks,
+                    "numeric_features": ",".join(assembler_inputs),
+                    "categorical_features": ",".join(available_categoricals),
+                }
+            )
+            logger.info(
+                "Evaluation metrics | accuracy=%.4f roc_auc=%.4f pos_rate_train=%.4f pos_rate_test=%.4f",
+                metrics["accuracy"],
+                metrics["roc_auc"],
+                metrics["positive_rate_train"],
+                metrics["positive_rate_test"],
+            )
+
+            model_name = get_model_name()
+            mlflow.spark.log_model(
+                model,
+                artifact_path="model",
+                registered_model_name=model_name,
+            )
+
+            client = get_mlflow_client()
+            registered_versions = client.search_model_versions(
+                filter_string=f"run_id='{run.info.run_id}'"
+            )
+            if not registered_versions:
+                raise RuntimeError("Model registration failed")
+
+            version = registered_versions[0].version
+            logger.info("Registered model %s version %s", model_name, version)
+            client.transition_model_version_stage(
+                name=model_name,
+                version=version,
+                stage="Production",
+                archive_existing_versions=True,
+            )
+            logger.info("Promoted model %s version %s to Production", model_name, version)
+
+            mlflow.set_tag("model_version", version)
+            mlflow.set_tag("production_ready", True)
+    finally:
+        spark.stop()
 
     return version
 

@@ -8,6 +8,7 @@ Proyecto de referencia que combina ETL de criptoactivos y un pipeline de churn c
 - **MLflow 2.10**: tracking server + model registry con artefactos en MinIO.
 - **MinIO**: backend S3 compatible (`s3://mlflow-artifacts/`).
 - **JupyterLab**: entorno de exploración y notebooks.
+- **Apache Spark**: clúster standalone (master + worker) para entrenar el modelo de churn con Spark ML.
 - **Streamlit**: UI para explorar el modelo de churn registrado en MLflow.
 
 ## Estructura relevante
@@ -116,6 +117,16 @@ docker compose --env-file .env -f docker/docker-compose.yml up -d streamlit
 La interfaz permite cargar manualmente los features semanales definidos en `ml/model_config.py`
 y obtiene la probabilidad estimada de churn directamente desde MLflow, sin utilizar
 `MLFlowDeploymentService`.
+
+### Entrenamiento con Spark
+El script `ml/train.py` utiliza Spark ML (LogisticRegression) para entrenar el modelo de churn.
+El clúster standalone incluido en `docker-compose` (servicios `spark-master` y
+`spark-worker`) se levanta automáticamente al ejecutar `make up`. El driver, que corre dentro del
+contenedor de Airflow, se conecta mediante la URL configurada en `SPARK_MASTER_URL`
+(`spark://spark-master:7077` por defecto).
+
+Si modificás las dependencias de Airflow, reconstruí la imagen o instalá `pyspark` manualmente en el
+contenedor antes de re-ejecutar el DAG de entrenamiento.
 
 ## Notebooks y análisis
 El contenedor de Jupyter monta el repo completo en `/home/jovyan/work`. Los notebooks disponen de las mismas variables de conexión que Airflow (`POSTGRES_*`, `MLFLOW_*`).

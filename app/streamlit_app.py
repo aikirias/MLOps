@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import mlflow
-import mlflow.sklearn
+import mlflow.pyfunc
 import pandas as pd
 import streamlit as st
 from PIL import Image
@@ -55,7 +55,7 @@ def _load_model() -> Any:
     tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
     mlflow.set_tracking_uri(tracking_uri)
     model_uri = f"models:/{MODEL_NAME}/{MODEL_STAGE}"
-    return mlflow.sklearn.load_model(model_uri)
+    return mlflow.pyfunc.load_model(model_uri)
 
 
 def _safe_load_image(name: str) -> Image.Image | None:
@@ -68,32 +68,40 @@ def _safe_load_image(name: str) -> Image.Image | None:
     return None
 
 
-def _predict(payload: Dict[str, List[float]]) -> float:
+def _extract_probability(output: Any) -> float:
+    if isinstance(output, pd.DataFrame):
+        if "probability" in output.columns:
+            value = output.loc[0, "probability"]
+            if hasattr(value, "__getitem__"):
+                return float(value[1])
+            return float(value)
+        if "prediction" in output.columns:
+            return float(output.loc[0, "prediction"])
+    if isinstance(output, pd.Series):
+        return float(output.iloc[0])
+    if isinstance(output, (list, tuple)):
+        return float(output[0])
+    return float(output)
+
+
+def _predict(payload: Dict[str, List[Any]]) -> float:
     model = _load_model()
     df = pd.DataFrame(payload)
-    if hasattr(model, "predict_proba"):
-        proba = model.predict_proba(df)
-        return float(proba[0][1])
-    prediction = model.predict(df)
-    if isinstance(prediction, pd.Series):
-        return float(prediction.iloc[0])
-    if isinstance(prediction, (list, tuple)):
-        return float(prediction[0])
-    return float(prediction)
+    prediction_output = model.predict(df)
+    return _extract_probability(prediction_output)
 
 
 def _layout_header() -> None:
-    st.title("Customer Satisfaction Predictor")
+    st.title("Churn Predictor Dashboard")
     hero = _safe_load_image("high_level_placeholder.png")
     if hero is not None:
         st.image(hero, caption="Pipeline Overview", use_column_width=True)
     st.markdown(
         """
         ### Context
-        Ingrese las características asociadas a la compra de un cliente y obtenga
-        una predicción del puntaje de satisfacción (0 a 5). El modelo se
-        encuentra registrado en MLflow y se carga directamente desde allí sin
-        depender de `MLFlowDeploymentService`.
+        Configure los atributos recientes del cliente y obtenga la probabilidad de
+        churn estimada por el modelo registrado en MLflow. El dashboard se conecta
+        directamente al model registry sin utilizar `MLFlowDeploymentService`.
         """
     )
 

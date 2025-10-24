@@ -5,7 +5,10 @@ from datetime import datetime
 from typing import Dict
 
 import mlflow
+import mlflow.artifacts
 import pandas as pd
+from pyspark.ml.pipeline import PipelineModel
+from pyspark.sql import SparkSession
 from sqlalchemy import text
 
 try:
@@ -49,7 +52,35 @@ def _prepare_features(df: pd.DataFrame) -> pd.DataFrame:
     return prepared
 
 
-def _load_production_model() -> Dict[str, object]:
+def _create_spark_session(app_name: str = "churn-infer") -> SparkSession:
+    master = os.getenv("SPARK_MASTER_URL", "local[*]")
+    spark = (
+        SparkSession.builder.appName(app_name)
+        .master(master)
+        .config("spark.sql.shuffle.partitions", os.getenv("SPARK_SQL_SHUFFLE_PARTITIONS", "32"))
+        .getOrCreate()
+    )
+
+    hadoop_conf = spark._jsc.hadoopConfiguration()
+    endpoint = os.getenv("S3_ENDPOINT_URL", "http://minio:9000")
+    access_key = os.getenv("AWS_ACCESS_KEY_ID", "")
+    secret_key = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+
+    hadoop_conf.set("fs.s3a.endpoint", endpoint)
+    hadoop_conf.set("fs.s3a.access.key", access_key)
+    hadoop_conf.set("fs.s3a.secret.key", secret_key)
+    hadoop_conf.set("fs.s3a.path.style.access", "true")
+    hadoop_conf.set("fs.s3a.fast.upload", "true")
+    hadoop_conf.set(
+        "fs.s3a.connection.ssl.enabled", str(endpoint.startswith("https")).lower()
+    )
+    hadoop_conf.set(
+        "fs.s3a.aws.credentials.provider", "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider"
+    )
+    return spark
+
+
+def _load_production_model(spark: SparkSession) -> Dict[str, object]:
     model_name = get_model_name()
     client = get_mlflow_client()
     latest = client.get_latest_versions(model_name, stages=["Production"])
@@ -58,36 +89,55 @@ def _load_production_model() -> Dict[str, object]:
 
     version = latest[0].version
     mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000"))
-    sklearn_model = mlflow.sklearn.load_model(f"models:/{model_name}/Production")
-    return {"model": sklearn_model, "version": version}
+
+    local_dir = mlflow.artifacts.download_artifacts(
+        artifact_uri=f"models:/{model_name}/Production"
+    )
+    model_path = os.path.join(local_dir, "sparkml")
+    spark_model = PipelineModel.load(model_path)
+    return {"model": spark_model, "version": version}
 
 
 def score_snapshot(snapshot_date: str, decision_threshold: float = 0.5) -> None:
     raw_df = _load_snapshot(snapshot_date)
     features_df = _prepare_features(raw_df)
 
-    feature_columns = [
+    relevant_columns = [
         *(col for col in NUMERIC_FEATURES if col in features_df.columns),
         *(col for col in BINARY_FEATURES if col in features_df.columns),
         *(col for col in CATEGORICAL_FEATURES if col in features_df.columns),
+        "customer_id",
+        "snapshot_date",
     ]
 
-    bundle = _load_production_model()
-    model = bundle["model"]
-    version = bundle["version"]
+    spark = _create_spark_session()
+    try:
+        bundle = _load_production_model(spark)
+        model = bundle["model"]
+        version = bundle["version"]
 
-    probabilities = model.predict_proba(features_df[feature_columns])[:, 1]
-    predictions = (probabilities >= decision_threshold).astype(int)
+        spark_features = spark.createDataFrame(features_df[relevant_columns])
+        predictions_spark = model.transform(spark_features)
+        predictions_pdf = predictions_spark.select(
+            "customer_id", "snapshot_date", "probability", "prediction"
+        ).toPandas()
 
-    output = pd.DataFrame(
-        {
-            "customer_id": raw_df["customer_id"],
-            "snapshot_date": pd.to_datetime(raw_df["snapshot_date"]).dt.date,
-            "score": probabilities,
-            "prediction": predictions,
-            "model_version": str(version),
-        }
-    )
+        probabilities = predictions_pdf["probability"].apply(
+            lambda v: float(v[1]) if hasattr(v, "__getitem__") else float(v)
+        )
+        predicted_labels = (probabilities >= decision_threshold).astype(int)
+
+        output = pd.DataFrame(
+            {
+                "customer_id": predictions_pdf["customer_id"],
+                "snapshot_date": pd.to_datetime(predictions_pdf["snapshot_date"]).dt.date,
+                "score": probabilities.values,
+                "prediction": predicted_labels.values,
+                "model_version": str(version),
+            }
+        )
+    finally:
+        spark.stop()
 
     engine = get_engine()
     with engine.begin() as conn:
